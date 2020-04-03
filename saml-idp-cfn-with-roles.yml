@@ -1,0 +1,346 @@
+
+
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Demonstrates creation of SAML Identity Provider with Custom Resource. '
+
+Parameters:
+  Name: 
+    Description: The name of the SAML Identity Provider to create.
+    Type: String
+  Metadata:
+    Description: The SAML IDP Metadata that will be used for the creation of the SAML Identity Provider
+    Type: String
+    Default: ''
+  MetadataUrl:
+    Description: There Url where the SAML IDP Metadata can be downloaded. This is only applied if the Metadata parameter is empty.
+    Type: String
+    Default: ''
+  MaxSessionDuration:
+    Description: The max session duration, in seconds. Default is 3600 seconds (1 hour).
+    Type: Number
+    Default: 3600
+    MinValue: 3600
+    MaxValue: 43200
+
+Resources:
+  SAMLProvider:
+    Type: Custom::SAMLIdentityProvider
+    Properties:
+      # The Arn of the Lambda function that will handle this CustomResource request. This is declared earlier in the template.
+      ServiceToken: !GetAtt LambdaSAMLIdentityProviderCustomResource.Arn
+      # The name of the SAML Identity Provider to create. Must be unique.
+      Name: !Ref Name
+      # The SAML IDP Metadata that will be used for the creation of the SAML Identity Provider
+      Metadata: !Ref 'Metadata'
+      # There Url where the SAML IDP Metadata can be downloaded. This is only applied if the Metadata parameter is empty.
+      MetadataUrl: !Ref 'MetadataUrl'
+
+  # IAM Role for Lambda to create, update, and delete SAML Identity Providers
+  LambdaSAMLIdentityProviderCustomResourceExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - lambda.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Path: "/"
+      Policies:
+      - PolicyName: SAMLProviderPolicy
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action:
+                - iam:CreateSAMLProvider
+                - iam:UpdateSAMLProvider
+                - iam:DeleteSAMLProvider
+              Resource: '*'     
+            - Effect: Allow
+              Action: 
+              - 'logs:CreateLogGroup'
+              - 'logs:CreateLogStream'
+              - 'logs:PutLogEvents'
+              Resource: 'arn:aws:logs:*:*:*'
+
+  #Lambda function that handles Custom::SAMLIDP
+  LambdaSAMLIdentityProviderCustomResource:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: Cloudformation Custom Resource function used to create SAML Identity Providers in IAM
+      Handler: index.handler
+      Role: !GetAtt LambdaSAMLIdentityProviderCustomResourceExecutionRole.Arn
+      Code:
+        ZipFile: |
+          import logging
+          import boto3
+          import urllib3
+          from botocore.exceptions import ClientError
+          import cfnresponse
+
+          logger = logging.getLogger(__name__)
+          logger.setLevel(logging.DEBUG)
+
+          try:
+              iam_client = boto3.client("iam")
+              pass
+          except Exception as e:
+              logger.error('Unable to create IAM client: {}'.format(str(e)))
+
+          def get_url(url):
+              http = urllib3.PoolManager()
+              logger.debug ('Fetching: {}'.format(url))
+              r = http.request('GET', url)
+              if r.status != 200:
+                  raise ValueError ('Non-200 HTTP result: {}' )
+              return r.data.decode('utf-8')
+          def build_arn(name):
+              return "arn:aws:iam::" + boto3.client('sts').get_caller_identity().get('Account') + ":saml-provider/" + name
+          def create(name, metadata):
+              logger.info("Got Create")   
+              provider = iam_client.create_saml_provider(SAMLMetadataDocument=metadata,Name=name)
+              logger.info("Arn: {}".format(provider['SAMLProviderArn']))
+              return cfnresponse.SUCCESS, {"Arn": provider['SAMLProviderArn']}, provider['SAMLProviderArn']
+          def update(physical_id, metadata):
+              logger.info("Got Update")
+              provider = iam_client.update_saml_provider(SAMLMetadataDocument=metadata, SAMLProviderArn=physical_id)
+              return cfnresponse.SUCCESS, {"Arn": provider['SAMLProviderArn']}, provider['SAMLProviderArn']
+          def delete(physical_id):
+              logger.info("Got Delete")
+              try:
+                  iam_client.delete_saml_provider(SAMLProviderArn=physical_id)
+                  logger.info ('Deleted: {}'.format(physical_id))
+                  return cfnresponse.SUCCESS, {}, physical_id
+              except ClientError as e:
+                  if e.response['Error']['Code'] == "NoSuchEntity":
+                      logger.warn('Provider {} does not exist.'.format(physical_id))
+                      return cfnresponse.SUCCESS, {}, physical_id
+                  else:
+                      raise ValueError("Cannot delete SAML provider " + physical_id + ": " + str(e))
+          def handler(event, context):
+              logger.debug(event)
+              if iam_client == None:
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {'Reason': 'Unable to create IAM Client.'})
+              try:
+                  name = event.get('ResourceProperties').get('Name')
+                  metadata = event.get('ResourceProperties').get('Metadata', '') 
+                  metadata_url = event.get('ResourceProperties').get('MetadataUrl', '')
+                  physical_id = event.get('PhysicalResourceId', '')
+                  if metadata == '' and metadata_url != '':
+                      metadata = get_url(metadata_url)
+                  logger.debug("Metadata: {}".format(metadata))   
+                  if event['RequestType'] == 'Create':
+                      response, data, physical_id = create(name, metadata)
+                  elif event['RequestType'] == 'Update':
+                      if event.get('OldResourceProperties').get('Name') != name:
+                          response, data, physical_id = create(name, metadata)
+                      else: response, data, physical_id  = update(physical_id, metadata)
+                  elif event['RequestType'] == 'Delete':
+                      response, data, physical_id = delete(physical_id)
+                  else:
+                      logger.error('Unknown operation: {}'.format(event['RequestType']))
+                      raise ValueError ('Unknown Operation.')
+                  cfnresponse.send(event, context, response, data, physical_id)
+              except Exception as e:
+                  logger.error('Exception: {}'.format(str(e)))
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {'Reason': str(e)}, physical_id)
+                  raise
+      Runtime: python3.7
+      Timeout: 120
+
+  AccountAdmin:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: AWS-AccountAdmin
+      Description: Grants full access, including ability to edit IAM users. This should ONLY be used by AWS service admins or for exceptions. Use AWS-PowerUser role by default.
+      MaxSessionDuration: !Ref MaxSessionDuration        
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          Effect: Allow
+          Principal: 
+            Federated: !GetAtt SAMLProvider.Arn
+          Action: "sts:AssumeRoleWithSAML"
+          Condition: 
+            StringEquals: 
+              saml:aud: "https://signin.aws.amazon.com/saml"
+      ManagedPolicyArns:      
+        -  arn:aws:iam::aws:policy/AdministratorAccess
+  PowerUser:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: AWS-PowerUser
+      Description: Provides full access to AWS services and resources, but does not allow management of Users and groups. 
+      MaxSessionDuration: !Ref MaxSessionDuration    
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          Effect: Allow
+          Principal: 
+            Federated: !GetAtt SAMLProvider.Arn
+          Action: "sts:AssumeRoleWithSAML"
+          Condition: 
+            StringEquals: 
+              saml:aud: "https://signin.aws.amazon.com/saml"
+      ManagedPolicyArns:      
+        -  arn:aws:iam::aws:policy/PowerUserAccess
+  NetworkAdmin:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: AWS-NetworkAdmin
+      Description: Grants full access permissions to AWS services and actions required to set up and configure AWS network resources. 
+      MaxSessionDuration: !Ref MaxSessionDuration    
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          Effect: Allow
+          Principal: 
+            Federated: !GetAtt SAMLProvider.Arn
+          Action: "sts:AssumeRoleWithSAML"
+          Condition: 
+            StringEquals: 
+              saml:aud: "https://signin.aws.amazon.com/saml"
+      ManagedPolicyArns:      
+        -  arn:aws:iam::aws:policy/job-function/NetworkAdministrator
+  SysAdmin:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: AWS-SysAdmin
+      Description: Grants full access permissions necessary for resources required for application and development operations. 
+      MaxSessionDuration: !Ref MaxSessionDuration    
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          Effect: Allow
+          Principal: 
+            Federated: !GetAtt SAMLProvider.Arn
+          Action: "sts:AssumeRoleWithSAML"
+          Condition: 
+            StringEquals: 
+              saml:aud: "https://signin.aws.amazon.com/saml"
+      ManagedPolicyArns:      
+        -  arn:aws:iam::aws:policy/job-function/SystemAdministrator
+  Developer:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: AWS-Developer
+      Description: Grants access permissions necessary for resources required for development on existing infrastructure and resources, limits creation of new resources.     
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          Effect: Allow
+          Principal: 
+            Federated: !GetAtt SAMLProvider.Arn
+          Action: "sts:AssumeRoleWithSAML"
+          Condition: 
+            StringEquals: 
+              saml:aud: "https://signin.aws.amazon.com/saml"
+      ManagedPolicyArns:      
+        - arn:aws:iam::aws:policy/job-function/DataScientist
+
+  ReadOnly:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: AWS-ReadOnly
+      Description: Grants read access to all resources in the account. 
+      MaxSessionDuration: !Ref MaxSessionDuration
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          Effect: Allow
+          Principal: 
+            Federated: !GetAtt SAMLProvider.Arn
+          Action: "sts:AssumeRoleWithSAML"
+          Condition: 
+            StringEquals: 
+              saml:aud: "https://signin.aws.amazon.com/saml"
+      ManagedPolicyArns:      
+        -  arn:aws:iam::aws:policy/ReadOnlyAccess
+  Billing:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: AWS-Billing
+      Description: Grants permissions for billing and cost management. This includes viewing account usage and viewing and modifying budgets and payment methods. 
+      MaxSessionDuration: !Ref MaxSessionDuration        
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          Effect: Allow
+          Principal: 
+            Federated: !GetAtt SAMLProvider.Arn
+          Action: "sts:AssumeRoleWithSAML"
+          Condition: 
+            StringEquals: 
+              saml:aud: "https://signin.aws.amazon.com/saml"
+      ManagedPolicyArns:      
+        -  arn:aws:iam::aws:policy/job-function/Billing
+
+  ReadOnlyBillingPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+        - Effect: Allow
+          Action: aws-portal:View*
+          Resource: '*'
+        - Effect: Deny
+          Action: aws-portal:*Account
+          Resource: '*'
+
+  ReadOnlyBilling:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: AWS-ReadOnlyBilling
+      Description: Grants Read Only access to the billing console.
+      MaxSessionDuration: !Ref MaxSessionDuration        
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          Effect: Allow
+          Principal: 
+            Federated: !GetAtt SAMLProvider.Arn
+          Action: "sts:AssumeRoleWithSAML"
+          Condition: 
+            StringEquals: 
+              saml:aud: "https://signin.aws.amazon.com/saml"
+      ManagedPolicyArns:      
+        -  !Ref ReadOnlyBillingPolicy
+
+Outputs:
+  SAMLProvider:
+    Description: Arn of the SAML Identity Provider
+    Value: !GetAtt SAMLProvider.Arn
+  AccountAdmin: 
+    Description: Grants full access, including ability to edit IAM users. This should ONLY be used by AWS service admins or for exceptions. Use AWS-PowerUser role by default.
+    Value: !Ref AccountAdmin
+  PowerUser: 
+    Value: !Ref PowerUser
+    Description: Provides full access to AWS services and resources, but does not allow management of Users and groups. 
+  SysAdmin:
+    Value: !Ref SysAdmin
+    Description: Grants full access permissions necessary for resources required for application and development operations. 
+  NetworkAdmin:
+    Value: !Ref NetworkAdmin
+    Description: Grants full access permissions necessary for managing networking in the account.  
+  Developer:
+    Value: !Ref Developer
+    Description: Grants access permissions necessary for resources required for development on existing infrastructure and resources, limits creation of new resources.     
+  ReadOnly:
+    Value: !Ref ReadOnly
+    Description: Grants read access to all resources in the account. 
+  Billing:
+    Description: Grants permissions for billing and cost management. This includes viewing account usage and viewing and modifying budgets and payment methods. 
+    Value: !Ref Billing
+  ReadOnlyBilling:
+    Value: !Ref ReadOnlyBilling
+    Description: Grants Read Only access to the billing console.
+
+
+
+        
+
